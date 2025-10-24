@@ -18,7 +18,10 @@ env/
 # Ignore semua bytecode Python (.pyc, .pyo)
 *.pyc
 __pycache__/
+# Isi .gitignore (Pastikan ini ada!)
 
+dev.nix
+scheduled_jobs.json
 # ----------------------------------------------------------------------
 # 3. Dependencies Python
 # ----------------------------------------------------------------------
