@@ -1,4 +1,0 @@
-python-telegram-bot
-firebase-admin
-flask
-python-dotenv  # <-- Tambahkan ini
