@@ -31,18 +31,17 @@ PENDING_JOBS_STORE = []
 
 # --- KONFIGURASI UNTUK FITUR PENGHAPUS PESAN BARU ---
 KEYWORD_TO_DELAY_DELETE = ["Laporan Kata Kunci", "laporan terkirim", "laporan"]
-DELAY_MINUTES = 10080  # 1 minggu
+DELAY_MINUTES = 10080  # 1 minggu (7 hari x 24 jam x 60 menit)
 
 BANNED_WORDS = {
     "kontol", "anjing", "babi", "asu", "memek", "pecun", "tolol", "goblok", "jancok"
 }
 
 # ID GRUP BOT BERJALAN: Target Deleter IDs
-# Bot akan menghapus kata kasar dan menjadwalkan penghapusan "Laporan terkirim" di grup-grup ini.
 TARGET_DELETER_IDS = [
     -1003027534985,  # ID Grup 1 (dari pengguna)
     -1001564023478,  # ID Grup 2 (dari pengguna)
-    -1002985230022   # ID Grup 3 (baru ditambahkan)
+    -1002985230022    # ID Grup 3 (baru ditambahkan)
     # Tambahkan ID grup lain di sini
 ]
 # -----------------------------------------------------
@@ -68,6 +67,8 @@ def save_data():
     try:
         with open(DATA_FILE, 'w', encoding='utf-8') as f:
             json.dump(USER_DATA_STORE, f, indent=4, ensure_ascii=False)
+        # PENAMBAHAN KONFIRMASI (DEBUGGING)
+        logger.info(f"Data pengguna berhasil disimpan ke {DATA_FILE}.")
     except Exception as e:
         logger.error(f"Gagal menyimpan data pengguna ke file: {e}")
 
@@ -99,6 +100,8 @@ def save_jobs():
         ]
         with open(JOBS_FILE, 'w', encoding='utf-8') as f:
             json.dump(serializable_jobs, f, indent=4, ensure_ascii=False)
+        # PENAMBAHAN KONFIRMASI (DEBUGGING)
+        logger.info(f"Scheduled jobs berhasil disimpan ke {JOBS_FILE}.")
     except Exception as e:
         logger.error(f"Gagal menyimpan scheduled jobs ke file: {e}")
 
@@ -303,9 +306,11 @@ async def keyword_deleter(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # --- 6. HANDLER PERINTAH: /history (RINGKAS) ---
 
 async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Menampilkan riwayat perubahan nama pengguna, diurutkan dari yang paling lama, dengan format ringkas."""
-    
+    """Menampilkan riwayat perubahan nama pengguna, diurutkan dari yang paling lama, dengan format ringkas.
+    Memastikan data pengguna yang memanggil perintah terinisialisasi jika belum ada."""
+
     target_user_id = None
+    caller_id = str(update.effective_user.id)
     
     # 1. Tentukan ID Pengguna Target
     if update.message.reply_to_message:
@@ -317,14 +322,34 @@ async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 target_user_id = user_id_key
                 break
     else:
-        target_user_id = str(update.effective_user.id)
+        # Jika tidak ada reply atau argumen, target adalah pengguna yang memanggil
+        target_user_id = caller_id
 
-    # 2. Ambil Data
+    # 2. Ambil atau Inisialisasi Data
     data = USER_DATA_STORE.get(target_user_id)
     
+    is_caller_target = target_user_id == caller_id
+    
+    # KUNCI PERBAIKAN: Jika pengguna mengecek dirinya sendiri TETAPI data belum ada, inisialisasi.
+    if not data and is_caller_target:
+        # Inisialisasi data pengguna yang baru saja memanggil perintah
+        user = update.effective_user
+        current_data = {
+            'full_name': user.full_name,
+            'username': user.username,
+            'last_checked': datetime.now().isoformat(),
+            'history': []
+        }
+        USER_DATA_STORE[target_user_id] = current_data
+        save_data()
+        data = current_data
+        logger.info(f"Data pengguna baru ID {target_user_id} diinisialisasi melalui perintah /history.")
+    
     if not data:
-        response = "Pengguna tidak ditemukan atau belum pernah mengirim pesan sejak bot aktif."
+        # Jika target bukan diri sendiri dan data tidak ada
+        response = "Pengguna target tidak ditemukan atau belum pernah mengirim pesan sejak bot aktif."
     else:
+        # Lanjutkan dengan memproses data yang ada atau yang baru diinisialisasi
         history = data.get('history', [])
         
         # Format Judul
@@ -332,19 +357,21 @@ async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if data.get('username'):
             user_display += f" (@{data['username']})"
             
-        response = f"**Riwayat Profil ({len(history)} Perubahan):** {user_display}\n\n"
+        # Tambahkan ID di sini untuk debugging
+        response = f"**Riwayat Profil ({len(history)} Perubahan):** {user_display} (ID: `{target_user_id}`)\n\n"
         
         if not history:
-            response += "_Belum ada perubahan tercatat._"
+            response += "_Belum ada perubahan tercatat._\n"
+            if is_caller_target and len(USER_DATA_STORE[target_user_id].get('history', [])) == 0:
+                 response += "\n*Data profil Anda baru saja diinisialisasi. Kirim pesan biasa agar perubahan mulai dilacak.*"
         else:
             # Format Riwayat Ringkas
             for i, record in enumerate(history):
                 try:
-                    time_str = datetime.fromisoformat(record['timestamp']).strftime('%y/%m/%d %H:%M') # Format waktu ringkas
+                    time_str = datetime.fromisoformat(record['timestamp']).strftime('%y/%m/%d %H:%M')
                 except ValueError:
                     time_str = "Waktu Invalid"
                 
-                # Gabungkan semua dalam satu baris: [Waktu] [Tipe] [Lama] -> [Baru]
                 if record['type'] == 'full_name':
                     line = (
                         f"`{time_str}` 👤 `{record['old_value']}` → `{record['new_value']}`"
@@ -432,8 +459,7 @@ def main() -> None:
             jobs_after_reschedule.append(job) # Tetap di store sampai delete_message_job menghapusnya
             logger.warning(f"Job (ID: {message_id}) sudah lewat waktu. Dijadwalkan untuk dihapus segera.")
 
-    # PENDING_JOBS_STORE akan diperbarui oleh delete_message_job, jadi tidak perlu save_jobs() di sini, 
-    # karena job yang sudah lewat waktu akan segera dihapus dan memicu save_jobs() dari job function.
+    # PENDING_JOBS_STORE akan diperbarui oleh delete_message_job, jadi tidak perlu save_jobs() di sini.
     
     # --- PENDAFTARAN HANDLER ---
     
@@ -451,7 +477,6 @@ def main() -> None:
     application.add_handler(CommandHandler("history", show_history))
     
     # Handler 4: Pelacakan Profil (Jalankan pada semua pesan non-perintah)
-    # Filter diganti menjadi filters.ALL & ~filters.COMMAND untuk mencakup foto/dokumen dll.
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_changes_notify))
 
     logger.info("Bot berjalan. Siap memberi notifikasi perubahan profil dan mengelola job tertunda.")
