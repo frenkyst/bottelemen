@@ -420,7 +420,6 @@ async def check_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             text=response, 
             parse_mode='Markdown'
         )
-        logger.info(f"Debug data dikirim ke {chat_id} untuk user ID {target_user_id}.")
     except Exception as e:
         logger.error(f"Gagal mengirim debug data: {e}")
 
@@ -493,7 +492,7 @@ def main() -> None:
     # Handler 3: Perintah /history
     application.add_handler(CommandHandler("history", show_history))
     
-    # Handler 4: Debug Data
+    # Handler 4: Debug Data BARU
     application.add_handler(CommandHandler("check_data", check_data_command))
     
     # Handler 5: Pelacakan Profil (Jalankan pada semua pesan non-perintah)
