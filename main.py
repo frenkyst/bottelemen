@@ -38,7 +38,6 @@ BANNED_WORDS = {
 }
 
 # ID GRUP BOT BERJALAN: Target Deleter IDs
-# Bot akan menghapus kata kasar dan menjadwalkan penghapusan "Laporan terkirim" di grup-grup ini.
 TARGET_DELETER_IDS = [
     -1003027534985,  # ID Grup 1 (dari pengguna)
     -1001564023478,  # ID Grup 2 (dari pengguna)
@@ -130,7 +129,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def track_changes_notify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Mengecek perubahan nama pengguna. Notifikasi langsung ke chat, TANPA REPLY."""
     
-    # Hanya proses jika ada effective_user dan pesan memiliki teks/data.
+    # Hanya proses jika ada effective_user dan pesan memiliki teks/data, dan BUKAN perintah
     if not update.effective_user or not update.message or (update.message.text and update.message.text.startswith('/')):
         return
 
@@ -138,6 +137,10 @@ async def track_changes_notify(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = str(user.id)
     current_time = datetime.now().isoformat()
     
+    # --- LOG DEBUG KRITIS: Pastikan handler ini terpanggil ---
+    logger.info(f"Processing user ID: {user_id}. Full Name: {user.full_name}")
+    # -------------------------------------------------------
+
     last_data = USER_DATA_STORE.get(user_id)
     
     current_data = {
@@ -416,6 +419,8 @@ async def check_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"```json\n{debug_output}\n```"
         )
     else:
+        # Menambahkan logger di sini untuk memastikan kita tahu kapan data tidak ditemukan
+        logger.warning(f"Data pengguna ID {target_user_id} tidak ditemukan di USER_DATA_STORE.")
         response = f"Data pengguna ID `{target_user_id}` tidak ditemukan di penyimpanan in-memory saat ini."
 
     try:
@@ -484,7 +489,7 @@ def main() -> None:
     
     # --- PENDAFTARAN HANDLER ---
     
-    # Handler 1: Perintah /check_data (DIPINDAHKAN KE ATAS UNTUK PRIORITAS)
+    # Handler 1: Perintah Debug (/check_data)
     application.add_handler(CommandHandler("check_data", check_data_command))
     
     # Handler 2: Perintah /start
