@@ -68,8 +68,10 @@ def save_data():
     try:
         with open(DATA_FILE, 'w', encoding='utf-8') as f:
             json.dump(USER_DATA_STORE, f, indent=4, ensure_ascii=False)
+        logger.info(f"Data pengguna berhasil ditulis ke {DATA_FILE}.")
     except Exception as e:
-        logger.error(f"Gagal menyimpan data pengguna ke file: {e}")
+        # Catat error I/O file jika environment tidak mengizinkan penulisan
+        logger.error(f"Gagal menyimpan data pengguna ke file: {e}. Data HANYA disimpan dalam memori!")
 
 # --- FUNGSI I/O JOB PENJADWALAN ---
 
@@ -99,8 +101,9 @@ def save_jobs():
         ]
         with open(JOBS_FILE, 'w', encoding='utf-8') as f:
             json.dump(serializable_jobs, f, indent=4, ensure_ascii=False)
+        logger.info(f"Scheduled jobs berhasil ditulis ke {JOBS_FILE}.")
     except Exception as e:
-        logger.error(f"Gagal menyimpan scheduled jobs ke file: {e}")
+        logger.error(f"Gagal menyimpan scheduled jobs ke file: {e}. Jobs HANYA disimpan dalam memori!")
 
 
 # --- 2. HANDLER PERINTAH: /start (Pemeriksaan Kesehatan) ---
@@ -116,7 +119,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "1. Pelacakan perubahan nama/username.\n"
             "2. Penghapusan instan kata kasar.\n"
             "3. Penjadwalan penghapusan pesan laporan (delay: 1 minggu).\n\n"
-            "Gunakan /history untuk melihat riwayat perubahan profil."
+            "Gunakan /history untuk melihat riwayat perubahan profil.\n"
+            "Gunakan **/check_data** untuk melihat data profil internal bot (Debugging)."
         )
         await update.message.reply_text(response_text, parse_mode='Markdown')
         logger.info(f"Bot merespons /start di chat {update.effective_chat.id}")
@@ -220,7 +224,7 @@ async def delete_message_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id=chat_id,
             message_id=message_id
         )
-        logger.info(f"Pesan (ID: {message_id}) di {chat_id} berhasil dihapus.")
+        logger.info(f"Pesan (ID: {message_id}) di {chat_id} berhasil dihapus oleh job queue.")
     # Menangkap error spesifik API jika bot gagal menghapus pesan (misal: tidak ada izin)
     except error.BadRequest as e:
         logger.warning(f"Gagal menghapus pesan tertunda (ID: {message_id}) di {chat_id}. Bot mungkin bukan admin atau tidak memiliki izin 'Delete messages': {e}")
@@ -262,16 +266,16 @@ async def keyword_deleter(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         try:
             await context.bot.delete_message(
                 chat_id=chat_id,
-                message_id=message.message_id # Line 164
+                message_id=message.message_id
             )
             logger.info(f"Pesan di {chat_id} dihapus INSTAN karena mengandung kata kasar.")
             return # Hentikan pemprosesan lebih lanjut
             
         except error.BadRequest as e:
-            # PENTING: Jika terjadi error di sini (misalnya, izin bot kurang), catat dan lanjutkan
+            # PENTING: Bot tidak akan crash lagi, hanya mencatat ini.
             logger.error(f"Gagal menghapus pesan INSTAN di {chat_id}. Kemungkinan bot bukan admin atau tidak memiliki izin 'Delete messages': {e}")
         except Exception as e:
-            logger.error(f"Gagal menghapus pesan INSTAN di {chat_id}. Error umum lainnya: {e}")
+            logger.error(f"Gagal menghapus pesan INSTAN di {chat_id}. Error umum lainnya, bot tidak crash: {e}")
             
     # --- 5.2. PENJADWALAN PENGHAPUSAN (Multiple Keywords) ---
     if any(keyword.lower() in text_lower for keyword in KEYWORD_TO_DELAY_DELETE):
@@ -387,6 +391,39 @@ async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.warning(f"Gagal menghapus pesan perintah /history (setelah respons): {e}")
 
 
+# --- 6.5. HANDLER PERINTAH: /check_data (Debugging) ---
+
+async def check_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Menampilkan status data in-memory saat ini untuk tujuan debugging."""
+    chat_id = update.effective_chat.id
+    
+    # Pilih ID pengguna yang akan dicek (sendiri atau dari reply)
+    target_user_id = str(update.effective_user.id)
+    if update.message.reply_to_message:
+        target_user_id = str(update.message.reply_to_message.from_user.id)
+
+    data = USER_DATA_STORE.get(target_user_id)
+    
+    if data:
+        # Menggunakan JSON dump untuk representasi data yang mudah dibaca
+        debug_output = json.dumps(data, indent=2, ensure_ascii=False)
+        response = (
+            f"**DEBUG DATA UNTUK USER ID `{target_user_id}` (Internal Store):**\n\n"
+            f"```json\n{debug_output}\n```"
+        )
+    else:
+        response = f"Data pengguna ID `{target_user_id}` tidak ditemukan di penyimpanan in-memory saat ini."
+
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id, 
+            text=response, 
+            parse_mode='Markdown'
+        )
+        logger.info(f"Debug data dikirim ke {chat_id} untuk user ID {target_user_id}.")
+    except Exception as e:
+        logger.error(f"Gagal mengirim debug data: {e}")
+
 # --- 7. FUNGSI UTAMA: Main Program ---
 
 def main() -> None:
@@ -456,8 +493,10 @@ def main() -> None:
     # Handler 3: Perintah /history
     application.add_handler(CommandHandler("history", show_history))
     
-    # Handler 4: Pelacakan Profil (Jalankan pada semua pesan non-perintah)
-    # Filter diganti menjadi filters.ALL & ~filters.COMMAND untuk mencakup foto/dokumen dll.
+    # Handler 4: Debug Data
+    application.add_handler(CommandHandler("check_data", check_data_command))
+    
+    # Handler 5: Pelacakan Profil (Jalankan pada semua pesan non-perintah)
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_changes_notify))
 
     logger.info("Bot berjalan. Siap memberi notifikasi perubahan profil dan mengelola job tertunda.")
