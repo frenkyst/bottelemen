@@ -57,6 +57,7 @@ def load_data():
     try:
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
             USER_DATA_STORE = json.load(f)
+            # LOG DIAGNOSTIK KRITIS 1: Ukuran data saat dimuat
             logger.info(f"Data pengguna berhasil dimuat dari {DATA_FILE}. Total pengguna terlacak: {len(USER_DATA_STORE)}")
     except (FileNotFoundError, json.JSONDecodeError):
         USER_DATA_STORE = {}
@@ -67,7 +68,8 @@ def save_data():
     try:
         with open(DATA_FILE, 'w', encoding='utf-8') as f:
             json.dump(USER_DATA_STORE, f, indent=4, ensure_ascii=False)
-        logger.info(f"Data pengguna berhasil ditulis ke {DATA_FILE}.")
+        # LOG DIAGNOSTIK KRITIS 2: Ukuran data saat disimpan
+        logger.info(f"Data pengguna berhasil ditulis ke {DATA_FILE}. Total entries: {len(USER_DATA_STORE)}")
     except Exception as e:
         # Catat error I/O file jika environment tidak mengizinkan penulisan
         logger.error(f"Gagal menyimpan data pengguna ke file: {e}. Data HANYA disimpan dalam memori!")
@@ -407,7 +409,8 @@ async def check_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if update.message.reply_to_message:
         target_user_id = str(update.message.reply_to_message.from_user.id)
         
-    logger.info(f"Menerima perintah /check_data. Mengecek data untuk user ID: {target_user_id}")
+    # LOG DIAGNOSTIK KRITIS 3: Status in-memory store sebelum pencarian
+    logger.info(f"Menerima perintah /check_data. User Store Size: {len(USER_DATA_STORE)}. Mengecek data untuk user ID: {target_user_id}")
 
     data = USER_DATA_STORE.get(target_user_id)
     
@@ -419,9 +422,8 @@ async def check_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"```json\n{debug_output}\n```"
         )
     else:
-        # Menambahkan logger di sini untuk memastikan kita tahu kapan data tidak ditemukan
         logger.warning(f"Data pengguna ID {target_user_id} tidak ditemukan di USER_DATA_STORE.")
-        response = f"Data pengguna ID `{target_user_id}` tidak ditemukan di penyimpanan in-memory saat ini."
+        response = f"Pengguna tidak ditemukan atau belum pernah mengirim pesan sejak bot aktif."
 
     try:
         await context.bot.send_message(
