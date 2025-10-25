@@ -131,7 +131,7 @@ async def track_changes_notify(update: Update, context: ContextTypes.DEFAULT_TYP
     """Mengecek perubahan nama pengguna. Notifikasi langsung ke chat, TANPA REPLY."""
     
     # Hanya proses jika ada effective_user dan pesan memiliki teks/data.
-    if not update.effective_user or not update.message or update.message.text and update.message.text.startswith('/'):
+    if not update.effective_user or not update.message or (update.message.text and update.message.text.startswith('/')):
         return
 
     user = update.effective_user
@@ -399,8 +399,12 @@ async def check_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     # Pilih ID pengguna yang akan dicek (sendiri atau dari reply)
     target_user_id = str(update.effective_user.id)
+    
+    # Jika ada reply, gunakan ID pengguna yang di-reply
     if update.message.reply_to_message:
         target_user_id = str(update.message.reply_to_message.from_user.id)
+        
+    logger.info(f"Menerima perintah /check_data. Mengecek data untuk user ID: {target_user_id}")
 
     data = USER_DATA_STORE.get(target_user_id)
     
@@ -420,8 +424,9 @@ async def check_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             text=response, 
             parse_mode='Markdown'
         )
+        logger.info(f"Respons /check_data berhasil dikirim ke chat {chat_id}.")
     except Exception as e:
-        logger.error(f"Gagal mengirim debug data: {e}")
+        logger.error(f"Gagal mengirim debug data ke chat {chat_id}: {e}")
 
 # --- 7. FUNGSI UTAMA: Main Program ---
 
@@ -479,25 +484,25 @@ def main() -> None:
     
     # --- PENDAFTARAN HANDLER ---
     
-    # Handler 1: Perintah /start
+    # Handler 1: Perintah /check_data (DIPINDAHKAN KE ATAS UNTUK PRIORITAS)
+    application.add_handler(CommandHandler("check_data", check_data_command))
+    
+    # Handler 2: Perintah /start
     application.add_handler(CommandHandler("start", start_command))
+    
+    # Handler 3: Perintah /history
+    application.add_handler(CommandHandler("history", show_history))
 
-    # Handler 2: Penghapus Pesan dan Penjadwalan (Hanya di TARGET_DELETER_IDS)
+    # Handler 4: Penghapus Pesan dan Penjadwalan (Hanya di TARGET_DELETER_IDS)
     deleter_handler = MessageHandler(
         filters=filters.TEXT & filters.Chat(TARGET_DELETER_IDS), 
         callback=keyword_deleter
     )
     application.add_handler(deleter_handler)
     
-    # Handler 3: Perintah /history
-    application.add_handler(CommandHandler("history", show_history))
-    
-    # Handler 4: Debug Data BARU
-    application.add_handler(CommandHandler("check_data", check_data_command))
-    
     # Handler 5: Pelacakan Profil (Jalankan pada semua pesan non-perintah)
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_changes_notify))
-
+    
     logger.info("Bot berjalan. Siap memberi notifikasi perubahan profil dan mengelola job tertunda.")
     application.run_polling(poll_interval=1)
 
