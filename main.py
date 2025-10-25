@@ -26,7 +26,7 @@ PENDING_JOBS_STORE = []
 # Kata kunci untuk penghapusan TERTUNDA (setelah 10 menit)
 # TELAH DIUBAH MENJADI DAFTAR UNTUK MENDUKUNG BEBERAPA FRASA
 KEYWORD_TO_DELAY_DELETE = ["Laporan Kata Kunci", "laporan terkirim", "laporan"]
-DELAY_MINUTES = 100 
+DELAY_MINUTES = 10080 
 
 # Kata-kata kasar/spam yang dihapus SECARA INSTAN (Case Insensitive)
 BANNED_WORDS = {
