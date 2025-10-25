@@ -1,323 +1,467 @@
-<!DOCTYPE html>
-<html lang="id">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Simulasi Bot Profile Tracker Firestore</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Firebase Imports -->
-    <script type="module">
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, query, updateDoc, arrayUnion } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
-        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+import logging
+import os
+import json
+import sys
+from datetime import datetime, timedelta
+# Import 'error' untuk penanganan error API Telegram yang spesifik
+from telegram import Update, error 
+from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
+from dotenv import load_dotenv
 
-        setLogLevel('debug'); // Untuk melihat log koneksi
+# --- 1. KONFIGURASI DAN UTILITAS FILE ---
+# Memuat variabel lingkungan dari .env
+if not load_dotenv():
+    print("WARNING: File .env tidak ditemukan. Membaca dari environment global.")
 
-        // --- GLOBAL VARIABLES (MANDATORY) ---
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-tracker-app-id';
-        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
-        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") 
+if not TOKEN:
+    print("\n--- ERROR FATAL ---")
+    print("TELEGRAM_BOT_TOKEN tidak ditemukan. Harap atur di file .env.")
+    print("-------------------\n")
+    sys.exit(1)
+else:
+    print(f"Token berhasil dimuat (Panjang: {len(TOKEN)})")
+
+# --- PERSISTENSI DATA ---
+DATA_FILE = "user_data.json"
+USER_DATA_STORE = {}
+
+JOBS_FILE = "scheduled_jobs.json"
+PENDING_JOBS_STORE = []
+
+# --- KONFIGURASI UNTUK FITUR PENGHAPUS PESAN BARU ---
+KEYWORD_TO_DELAY_DELETE = ["Laporan Kata Kunci", "laporan terkirim", "laporan"]
+DELAY_MINUTES = 10080  # 1 minggu
+
+BANNED_WORDS = {
+    "kontol", "anjing", "babi", "asu", "memek", "pecun", "tolol", "goblok", "jancok"
+}
+
+# ID GRUP BOT BERJALAN: Target Deleter IDs
+# Bot akan menghapus kata kasar dan menjadwalkan penghapusan "Laporan terkirim" di grup-grup ini.
+TARGET_DELETER_IDS = [
+    -1003027534985,  # ID Grup 1 (dari pengguna)
+    -1001564023478,  # ID Grup 2 (dari pengguna)
+    -1002985230022   # ID Grup 3 (baru ditambahkan)
+    # Tambahkan ID grup lain di sini
+]
+# -----------------------------------------------------
+
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- FUNGSI I/O DATA PENGGUNA ---
+
+def load_data():
+    """Memuat data profil pengguna dari file JSON saat bot dimulai."""
+    global USER_DATA_STORE
+    try:
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            USER_DATA_STORE = json.load(f)
+            logger.info(f"Data pengguna berhasil dimuat dari {DATA_FILE}. Total pengguna terlacak: {len(USER_DATA_STORE)}")
+    except (FileNotFoundError, json.JSONDecodeError):
+        USER_DATA_STORE = {}
+        logger.warning(f"File {DATA_FILE} tidak ditemukan atau rusak. Memulai dengan data kosong.")
+
+def save_data():
+    """Menyimpan data profil pengguna ke file JSON."""
+    try:
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(USER_DATA_STORE, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Gagal menyimpan data pengguna ke file: {e}")
+
+# --- FUNGSI I/O JOB PENJADWALAN ---
+
+def load_jobs():
+    """Memuat daftar tugas penghapusan yang tertunda dari file JSON."""
+    global PENDING_JOBS_STORE
+    try:
+        with open(JOBS_FILE, 'r', encoding='utf-8') as f:
+            raw_jobs = json.load(f)
+            # Konversi string waktu kembali menjadi objek datetime
+            PENDING_JOBS_STORE = [
+                {**job, 'deletion_time': datetime.fromisoformat(job['deletion_time'])}
+                for job in raw_jobs
+            ]
+            logger.info(f"Scheduled jobs berhasil dimuat dari {JOBS_FILE}. Total jobs: {len(PENDING_JOBS_STORE)}")
+    except (FileNotFoundError, json.JSONDecodeError):
+        PENDING_JOBS_STORE = []
+        logger.warning(f"File {JOBS_FILE} tidak ditemukan atau rusak. Memulai dengan daftar job kosong.")
+
+def save_jobs():
+    """Menyimpan daftar tugas penghapusan yang tertunda ke file JSON."""
+    try:
+        # Konversi objek datetime menjadi string ISO format untuk penyimpanan
+        serializable_jobs = [
+            {**job, 'deletion_time': job['deletion_time'].isoformat()}
+            for job in PENDING_JOBS_STORE
+        ]
+        with open(JOBS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(serializable_jobs, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Gagal menyimpan scheduled jobs ke file: {e}")
+
+
+# --- 2. HANDLER PERINTAH: /start (Pemeriksaan Kesehatan) ---
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Menanggapi perintah /start."""
+    chat_type = update.effective_chat.type
+    if chat_type in ["group", "supergroup"]:
+        # Hanya kirim pesan di grup
+        response_text = (
+            "🤖 **Bot Aktif dan Siap Melayani**\n\n"
+            "Fitur yang aktif:\n"
+            "1. Pelacakan perubahan nama/username.\n"
+            "2. Penghapusan instan kata kasar.\n"
+            "3. Penjadwalan penghapusan pesan laporan (delay: 1 minggu).\n\n"
+            "Gunakan /history untuk melihat riwayat perubahan profil."
+        )
+        await update.message.reply_text(response_text, parse_mode='Markdown')
+        logger.info(f"Bot merespons /start di chat {update.effective_chat.id}")
+
+# --- 3. HANDLER UTAMA: Pelacakan dan Notifikasi ---
+
+async def track_changes_notify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mengecek perubahan nama pengguna. Notifikasi langsung ke chat, TANPA REPLY."""
+    
+    # Hanya proses jika ada effective_user dan pesan memiliki teks/data.
+    if not update.effective_user or not update.message or update.message.text and update.message.text.startswith('/'):
+        return
+
+    user = update.effective_user
+    user_id = str(user.id)
+    current_time = datetime.now().isoformat()
+    
+    last_data = USER_DATA_STORE.get(user_id)
+    
+    current_data = {
+        'full_name': user.full_name,
+        'username': user.username,
+        'last_checked': current_time,
+        'history': []
+    }
+    
+    notification_parts = []
+    is_changed = False
+
+    if last_data:
+        # Pindahkan riwayat lama ke data saat ini
+        current_data['history'] = last_data.get('history', [])
         
-        // --- FIREBASE INITIALIZATION ---
-        const app = initializeApp(firebaseConfig);
-        const db = getFirestore(app);
-        const auth = getAuth(app);
-        
-        let userId = null;
-        let isAuthReady = false;
-
-        const PROFILE_COLLECTION = 'user_profiles';
-
-        /**
-         * Mendapatkan path koleksi publik/bersama.
-         * Kami menggunakan koleksi publik karena data pelacakan profil ini 
-         * idealnya dibagikan dan dapat diakses oleh semua pengguna dalam grup simulasi.
-         */
-        function getCollectionRef() {
-            // Path: /artifacts/{appId}/public/data/user_profiles
-            return collection(db, 'artifacts', appId, 'public', 'data', PROFILE_COLLECTION);
-        }
-
-        // --- AUTENTIKASI ---
-        async function authenticate() {
-            try {
-                if (initialAuthToken) {
-                    await signInWithCustomToken(auth, initialAuthToken);
-                } else {
-                    await signInAnonymously(auth);
-                }
-            } catch (error) {
-                console.error("Gagal melakukan autentikasi Firebase:", error);
+        # 1. Bandingkan Username
+        if last_data.get('username') != current_data['username']:
+            change_record = {
+                'type': 'username',
+                'old_value': last_data.get('username'),
+                'new_value': current_data['username'],
+                'timestamp': current_time
             }
-        }
-
-        onAuthStateChanged(auth, (user) => {
-            if (user) {
-                userId = user.uid;
-                isAuthReady = true;
-                console.log("Autentikasi Berhasil. User ID:", userId);
-                document.getElementById('current-user-id').textContent = `ID Anda: ${userId}`;
-                
-                // Setelah autentikasi, kita bisa mulai mendengarkan data profil
-                setupProfileListener();
-            } else {
-                isAuthReady = false;
-                userId = null;
-                console.warn("User ter-logout atau gagal autentikasi.");
-                document.getElementById('current-user-id').textContent = 'Authenticating...';
-            }
-        });
-        
-        // --- LOGIKA UTAMA: MELACAK PERUBAHAN ---
-
-        // State yang disimulasikan (ganti dengan input pengguna)
-        let simulatedProfile = {
-            id: 'simulated_user_123', // ID statis untuk contoh
-            fullName: 'Pengguna Uji Coba',
-            username: 'tester_simulasi',
-            lastUpdated: new Date().toISOString(),
-            history: []
-        };
-        
-        /**
-         * Menyimpan atau memperbarui profil ke Firestore.
-         */
-        async function saveProfile(profileData) {
-            if (!isAuthReady) {
-                console.error("Firestore belum siap. Autentikasi belum selesai.");
-                return;
-            }
-            try {
-                const userDocRef = doc(getCollectionRef(), profileData.id);
-                // Kita gunakan setDoc dengan merge: true agar tidak menimpa seluruh dokumen
-                await setDoc(userDocRef, {
-                    fullName: profileData.fullName,
-                    username: profileData.username,
-                    lastUpdated: profileData.lastUpdated,
-                    // Karena arrayUnion digunakan saat log history dibuat, kita tidak perlu 
-                    // mengirimkan seluruh array history di sini, cukup update data utama.
-                }, { merge: true });
-                console.log(`Profil ID ${profileData.id} berhasil disimpan/diperbarui.`);
-            } catch (e) {
-                console.error("Error saat menyimpan profil ke Firestore: ", e);
-            }
-        }
-
-        /**
-         * Melakukan simulasi perubahan profil dan mencatat riwayat (history) ke Firestore.
-         */
-        async function checkAndLogChanges(newFullName, newUsername) {
-            if (!isAuthReady) {
-                console.error("Firestore belum siap.");
-                return;
-            }
-
-            const userDocRef = doc(getCollectionRef(), simulatedProfile.id);
-            const docSnap = await getDoc(userDocRef);
+            current_data['history'].append(change_record)
             
-            let currentProfile = docSnap.exists() ? docSnap.data() : { fullName: '', username: '', history: [] };
-            let changes = [];
-            let isChanged = false;
-            const timestamp = new Date().toISOString();
-
-            // Cek perubahan Nama
-            if (currentProfile.fullName !== newFullName) {
-                changes.push({
-                    type: 'full_name',
-                    oldValue: currentProfile.fullName || 'None',
-                    newValue: newFullName,
-                    timestamp: timestamp
-                });
-                isChanged = true;
-            }
-
-            // Cek perubahan Username
-            if (currentProfile.username !== newUsername) {
-                changes.push({
-                    type: 'username',
-                    oldValue: currentProfile.username || 'None',
-                    newValue: newUsername,
-                    timestamp: timestamp
-                });
-                isChanged = true;
-            }
-
-            // Update di Firestore
-            if (isChanged || !docSnap.exists()) {
-                const updateData = {
-                    fullName: newFullName,
-                    username: newUsername,
-                    lastUpdated: timestamp,
-                };
-                
-                if (changes.length > 0) {
-                    // Gunakan arrayUnion untuk menambahkan perubahan ke array history
-                    updateData.history = arrayUnion(...changes);
-                }
-
-                await setDoc(userDocRef, updateData, { merge: true });
-
-                // Tampilkan notifikasi simulasi
-                const notificationEl = document.getElementById('notification-area');
-                notificationEl.innerHTML = changes.map(c => 
-                    `<p class="text-sm font-medium text-blue-600">🚨 Perubahan: ${c.type.toUpperCase()}: ${c.oldValue} → ${c.newValue}</p>`
-                ).join('');
-                setTimeout(() => notificationEl.innerHTML = '', 5000);
-            } else {
-                const notificationEl = document.getElementById('notification-area');
-                notificationEl.innerHTML = `<p class="text-sm text-gray-500">Tidak ada perubahan profil.</p>`;
-                setTimeout(() => notificationEl.innerHTML = '', 3000);
-            }
+            # Format notifikasi: @Old -> @New
+            old_user = last_data.get('username') or 'None'
+            new_user = current_data['username'] or 'None'
             
-            // Simpan data lokal untuk referensi
-            simulatedProfile.fullName = newFullName;
-            simulatedProfile.username = newUsername;
+            notification_parts.append(f"@ `@{'None' if old_user == 'None' else old_user}` → `@{'None' if new_user == 'None' else new_user}`")
+            is_changed = True
+            
+        # 2. Bandingkan Full Name
+        if last_data.get('full_name') != current_data['full_name']:
+            change_record = {
+                'type': 'full_name',
+                'old_value': last_data.get('full_name'),
+                'new_value': current_data['full_name'],
+                'timestamp': current_time
+            }
+            current_data['history'].append(change_record)
+            
+            notification_parts.append(
+                f"👤 `{change_record['old_value']}` → `{current_data['full_name']}`"
+            )
+            is_changed = True
+
+    # Simpan data baru (overwrite jika ada perubahan atau inisialisasi jika baru)
+    USER_DATA_STORE[user_id] = current_data
+    save_data()
+    
+    # Kirim Notifikasi jika perubahan terdeteksi
+    if is_changed:
+        
+        header = "🚨 **PROFIL BERUBAH**\n"
+        final_notification = header + "\n".join(notification_parts)
+        
+        # Tambahkan tautan pengguna saat ini di akhir
+        mention = f"\nOleh: [{user.full_name}](tg://user?id={user.id})"
+        final_notification += mention
+        
+        try:
+            # Menggunakan send_message() untuk mengirim pesan baru
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id, 
+                text=final_notification.strip(),
+                parse_mode='Markdown'
+            )
+            logger.info(f"Notifikasi perubahan profil langsung dikirim untuk ID {user_id}")
+        except Exception as e:
+             logger.error(f"Gagal mengirim notifikasi perubahan profil di chat {update.effective_chat.id}: {e}")
+
+# --- 4. FUNGSI JOB UNTUK PENGHAPUSAN TERTUNDA ---
+
+async def delete_message_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fungsi yang dieksekusi oleh job queue untuk menghapus pesan."""
+    job_data = context.job.data
+    chat_id = job_data['chat_id']
+    message_id = job_data['message_id']
+    
+    try:
+        await context.bot.delete_message(
+            chat_id=chat_id,
+            message_id=message_id
+        )
+        logger.info(f"Pesan (ID: {message_id}) di {chat_id} berhasil dihapus.")
+    # Menangkap error spesifik API jika bot gagal menghapus pesan (misal: tidak ada izin)
+    except error.BadRequest as e:
+        logger.warning(f"Gagal menghapus pesan tertunda (ID: {message_id}) di {chat_id}. Bot mungkin bukan admin atau tidak memiliki izin 'Delete messages': {e}")
+    except Exception as e:
+        # Pesan mungkin sudah dihapus secara manual atau error umum lainnya
+        logger.warning(f"Gagal menghapus pesan tertunda (ID: {message_id}) di {chat_id}: Error umum lainnya: {e}")
+        
+    # Hapus job dari persistence store, baik berhasil atau gagal
+    global PENDING_JOBS_STORE
+    initial_count = len(PENDING_JOBS_STORE)
+    
+    # Filter list, hanya menyisakan job yang TIDAK cocok dengan job yang baru dieksekusi
+    PENDING_JOBS_STORE = [
+        job for job in PENDING_JOBS_STORE 
+        if not (job['chat_id'] == chat_id and job['message_id'] == message_id)
+    ]
+    
+    if len(PENDING_JOBS_STORE) < initial_count:
+        save_jobs()
+        logger.info(f"Job (ID: {message_id}) dihapus dari persistence store.")
+
+
+# --- 5. HANDLER UNTUK PENGHAPUS PESAN INSTAN DAN PENJADWALAN ---
+
+async def keyword_deleter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Menangani penghapusan instan untuk kata kasar dan penjadwalan penghapusan tertunda."""
+    
+    message = update.effective_message
+    chat_id = update.effective_chat.id
+    
+    # Periksa apakah pesan memiliki teks dan berasal dari salah satu grup target
+    if not message.text or chat_id not in TARGET_DELETER_IDS:
+        return
+
+    text_lower = message.text.lower()
+    
+    # --- 5.1. PENGHAPUSAN INSTAN (Kata Kasar) ---
+    if any(word in text_lower for word in BANNED_WORDS):
+        try:
+            await context.bot.delete_message(
+                chat_id=chat_id,
+                message_id=message.message_id # Line 164
+            )
+            logger.info(f"Pesan di {chat_id} dihapus INSTAN karena mengandung kata kasar.")
+            return # Hentikan pemprosesan lebih lanjut
+            
+        except error.BadRequest as e:
+            # PENTING: Jika terjadi error di sini (misalnya, izin bot kurang), catat dan lanjutkan
+            logger.error(f"Gagal menghapus pesan INSTAN di {chat_id}. Kemungkinan bot bukan admin atau tidak memiliki izin 'Delete messages': {e}")
+        except Exception as e:
+            logger.error(f"Gagal menghapus pesan INSTAN di {chat_id}. Error umum lainnya: {e}")
+            
+    # --- 5.2. PENJADWALAN PENGHAPUSAN (Multiple Keywords) ---
+    if any(keyword.lower() in text_lower for keyword in KEYWORD_TO_DELAY_DELETE):
+        
+        # 1. Hitung waktu penghapusan target
+        now = datetime.now()
+        deletion_time = now + timedelta(minutes=DELAY_MINUTES)
+        
+        # 2. Simpan job ke persistence store
+        new_job_record = {
+            'chat_id': chat_id,
+            'message_id': message.message_id,
+            'deletion_time': deletion_time # Objek datetime
+        }
+        PENDING_JOBS_STORE.append(new_job_record)
+        save_jobs() 
+
+        # 3. Data yang diperlukan untuk job queue
+        job_data = {
+            'chat_id': chat_id,
+            'message_id': message.message_id
         }
 
-        /**
-         * Set up Listener Realtime (onSnapshot)
-         */
-        function setupProfileListener() {
-            const userDocRef = doc(getCollectionRef(), simulatedProfile.id);
+        # 4. Jadwalkan job
+        context.job_queue.run_once(
+            delete_message_job, 
+            timedelta(minutes=DELAY_MINUTES), 
+            data=job_data,
+            name=f"del_{chat_id}_{message.message_id}"
+        )
+        
+        logger.info(f"Pesan (keyword ditemukan) di {chat_id} dijadwalkan untuk dihapus pada {deletion_time.strftime('%Y-%m-%d %H:%M:%S')}.")
+
+
+# --- 6. HANDLER PERINTAH: /history (RINGKAS) ---
+
+async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Menampilkan riwayat perubahan nama pengguna, diurutkan dari yang paling lama, dengan format ringkas."""
+    
+    target_user_id = None
+    
+    # 1. Tentukan ID Pengguna Target
+    if update.message.reply_to_message:
+        target_user_id = str(update.message.reply_to_message.from_user.id)
+    elif context.args:
+        username = context.args[0].lstrip('@')
+        for user_id_key, data in USER_DATA_STORE.items():
+            if data.get('username', '').lower() == username.lower():
+                target_user_id = user_id_key
+                break
+    else:
+        target_user_id = str(update.effective_user.id)
+
+    # 2. Ambil Data
+    data = USER_DATA_STORE.get(target_user_id)
+    
+    if not data:
+        response = "Pengguna tidak ditemukan atau belum pernah mengirim pesan sejak bot aktif."
+    else:
+        history = data.get('history', [])
+        
+        # Format Judul
+        user_display = data.get('full_name', 'Nama Tidak Diketahui')
+        if data.get('username'):
+            user_display += f" (@{data['username']})"
             
-            onSnapshot(userDocRef, (docSnap) => {
-                const historyList = document.getElementById('history-list');
-                historyList.innerHTML = '';
+        response = f"**Riwayat Profil ({len(history)} Perubahan):** {user_display}\n\n"
+        
+        if not history:
+            response += "_Belum ada perubahan tercatat._"
+        else:
+            # Format Riwayat Ringkas
+            for i, record in enumerate(history):
+                try:
+                    time_str = datetime.fromisoformat(record['timestamp']).strftime('%y/%m/%d %H:%M') # Format waktu ringkas
+                except ValueError:
+                    time_str = "Waktu Invalid"
                 
-                if (docSnap.exists()) {
-                    const data = docSnap.data();
-                    const history = data.history || [];
+                # Gabungkan semua dalam satu baris: [Waktu] [Tipe] [Lama] -> [Baru]
+                if record['type'] == 'full_name':
+                    line = (
+                        f"`{time_str}` 👤 `{record['old_value']}` → `{record['new_value']}`"
+                    )
+                
+                elif record['type'] == 'username':
+                    # Pastikan 'None' muncul untuk username yang hilang
+                    old_user = record['old_value'] or 'None'
+                    new_user = record['new_value'] or 'None'
+                    line = (
+                        f"`{time_str}` @ `@{'None' if old_user == 'None' else old_user}` → `@{'None' if new_user == 'None' else new_user}`"
+                    )
                     
-                    document.getElementById('current-name-display').textContent = data.fullName || '-';
-                    document.getElementById('current-username-display').textContent = data.username ? `@${data.username}` : 'N/A';
-                    
-                    if (history.length > 0) {
-                         // Urutkan riwayat berdasarkan waktu (timestamp) terbaru di atas
-                         history.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-                         
-                         history.forEach((record, index) => {
-                            const date = new Date(record.timestamp).toLocaleString('id-ID', { 
-                                year: '2-digit', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' 
-                            });
-                            
-                            let detail = '';
-                            if (record.type === 'full_name') {
-                                detail = `Nama: ${record.oldValue} → ${record.newValue}`;
-                            } else if (record.type === 'username') {
-                                detail = `Username: @${record.oldValue} → @${record.newValue}`;
-                            }
-                            
-                            const listItem = `
-                                <li class="p-2 border-b border-gray-100 last:border-b-0 text-sm">
-                                    <span class="font-semibold text-gray-700">${date}</span>
-                                    <span class="text-xs text-gray-500 ml-2">(${record.type})</span>
-                                    <p class="text-xs text-gray-600 mt-1">${detail}</p>
-                                </li>
-                            `;
-                            historyList.innerHTML += listItem;
-                        });
-                    } else {
-                        historyList.innerHTML = '<li class="p-4 text-center text-gray-500">Belum ada riwayat perubahan.</li>';
-                    }
-                    
-                } else {
-                    // Dokumen belum ada, tampilkan pesan default
-                    historyList.innerHTML = '<li class="p-4 text-center text-gray-500">Profil ini belum pernah dilacak.</li>';
-                    document.getElementById('current-name-display').textContent = 'N/A';
-                    document.getElementById('current-username-display').textContent = 'N/A';
-                }
-            }, (error) => {
-                console.error("Error onSnapshot:", error);
-                document.getElementById('history-list').innerHTML = '<li class="p-4 text-red-500 text-center">Gagal memuat data realtime.</li>';
-            });
+                response += f"{i+1}. {line}\n"
+
+    # 3. Kirim Respons
+    try:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id, 
+            text=response, 
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Gagal mengirim riwayat profil di chat {update.effective_chat.id}: {e}")
+
+    # 4. Hapus Pesan Perintah Asli
+    try:
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=update.message.message_id
+        )
+        logger.info(f"Pesan perintah /history (ID: {update.message.message_id}) berhasil dihapus.")
+    except Exception as e:
+        logger.warning(f"Gagal menghapus pesan perintah /history (setelah respons): {e}")
+
+
+# --- 7. FUNGSI UTAMA: Main Program ---
+
+def main() -> None:
+    """Membuat dan menjalankan bot menggunakan Long Polling."""
+    
+    load_data()
+    
+    # Menggunakan application.job_queue secara default
+    application = Application.builder().token(TOKEN).build()
+    
+    # --- MEMULAI ULANG JOB YANG TERTUNDA DARI FILE ---
+    load_jobs()
+    now = datetime.now()
+    
+    jobs_to_reschedule = PENDING_JOBS_STORE[:] # Copy list untuk iterasi
+    jobs_after_reschedule = [] # List baru untuk job yang masih valid
+    
+    for job in jobs_to_reschedule:
+        chat_id = job['chat_id']
+        message_id = job['message_id']
+        deletion_time = job['deletion_time']
+        
+        # Hitung sisa waktu
+        remaining_delay = deletion_time - now
+        
+        job_data = {
+            'chat_id': chat_id,
+            'message_id': message_id
         }
         
-        // --- EVENT HANDLERS ---
-        window.onload = () => {
-            authenticate();
-            
-            document.getElementById('fullNameInput').value = simulatedProfile.fullName;
-            document.getElementById('usernameInput').value = simulatedProfile.username;
-            document.getElementById('simulated-id').textContent = `ID Simulasi: ${simulatedProfile.id}`;
+        if remaining_delay.total_seconds() > 0:
+            # Job masih di masa depan, jadwalkan dengan sisa waktu
+            application.job_queue.run_once(
+                delete_message_job, 
+                remaining_delay, 
+                data=job_data,
+                name=f"del_{chat_id}_{message_id}"
+            )
+            jobs_after_reschedule.append(job)
+            logger.info(f"Job (ID: {message_id}) dijadwalkan ulang. Sisa waktu: {remaining_delay}")
+        else:
+            # Job sudah lewat waktunya, jadwalkan untuk dihapus segera (1 detik)
+            application.job_queue.run_once(
+                delete_message_job, 
+                timedelta(seconds=1), 
+                data=job_data,
+                name=f"del_{chat_id}_{message_id}_immediate"
+            )
+            jobs_after_reschedule.append(job) # Tetap di store sampai delete_message_job menghapusnya
+            logger.warning(f"Job (ID: {message_id}) sudah lewat waktu. Dijadwalkan untuk dihapus segera.")
 
-            document.getElementById('updateButton').addEventListener('click', () => {
-                const newName = document.getElementById('fullNameInput').value.trim();
-                const newUser = document.getElementById('usernameInput').value.trim();
-                
-                if (newName === "") {
-                    alert("Nama lengkap tidak boleh kosong.");
-                    return;
-                }
-                
-                checkAndLogChanges(newName, newUser);
-            });
-        }
+    # PENDING_JOBS_STORE akan diperbarui oleh delete_message_job, jadi tidak perlu save_jobs() di sini, 
+    # karena job yang sudah lewat waktu akan segera dihapus dan memicu save_jobs() dari job function.
+    
+    # --- PENDAFTARAN HANDLER ---
+    
+    # Handler 1: Perintah /start
+    application.add_handler(CommandHandler("start", start_command))
 
-    </script>
-</head>
-<body class="bg-gray-50 min-h-screen p-4 sm:p-8 font-sans">
+    # Handler 2: Penghapus Pesan dan Penjadwalan (Hanya di TARGET_DELETER_IDS)
+    deleter_handler = MessageHandler(
+        filters=filters.TEXT & filters.Chat(TARGET_DELETER_IDS), 
+        callback=keyword_deleter
+    )
+    application.add_handler(deleter_handler)
+    
+    # Handler 3: Perintah /history
+    application.add_handler(CommandHandler("history", show_history))
+    
+    # Handler 4: Pelacakan Profil (Jalankan pada semua pesan non-perintah)
+    # Filter diganti menjadi filters.ALL & ~filters.COMMAND untuk mencakup foto/dokumen dll.
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_changes_notify))
 
-    <div class="max-w-4xl mx-auto bg-white shadow-xl rounded-2xl overflow-hidden">
-        
-        <!-- Header -->
-        <header class="bg-indigo-600 p-6 text-white">
-            <h1 class="text-2xl font-bold">Bot Profile Tracker ⚡️ (Firestore)</h1>
-            <p class="text-indigo-200 mt-1">Menggunakan Firestore untuk penyimpanan permanen. Tidak ada lagi masalah file JSON!</p>
-            <p id="current-user-id" class="text-xs mt-2 bg-indigo-700 p-1 rounded inline-block">Authenticating...</p>
-        </header>
+    logger.info("Bot berjalan. Siap memberi notifikasi perubahan profil dan mengelola job tertunda.")
+    application.run_polling(poll_interval=1)
 
-        <main class="grid md:grid-cols-2 gap-8 p-6 sm:p-8">
-            
-            <!-- 1. Simulasi Input -->
-            <div class="bg-white p-6 rounded-xl border border-indigo-100 shadow-lg">
-                <h2 class="text-xl font-semibold text-indigo-800 border-b pb-2 mb-4">Simulasi Pesan Baru</h2>
-                
-                <p id="simulated-id" class="text-sm text-gray-500 mb-4 font-mono"></p>
-                
-                <div class="space-y-4">
-                    <div>
-                        <label for="fullNameInput" class="block text-sm font-medium text-gray-700">Nama Lengkap (Simulasi Kirim Pesan)</label>
-                        <input type="text" id="fullNameInput" class="mt-1 block w-full border border-gray-300 rounded-lg shadow-sm p-3 focus:ring-indigo-500 focus:border-indigo-500" placeholder="Contoh: Budi Santoso">
-                    </div>
-                    <div>
-                        <label for="usernameInput" class="block text-sm font-medium text-gray-700">Username (@tanpa simbol)</label>
-                        <input type="text" id="usernameInput" class="mt-1 block w-full border border-gray-300 rounded-lg shadow-sm p-3 focus:ring-indigo-500 focus:border-indigo-500" placeholder="Contoh: budisanto">
-                    </div>
-                </div>
-
-                <div id="notification-area" class="mt-4 h-6 text-center"></div>
-
-                <button id="updateButton" class="w-full mt-6 bg-indigo-600 text-white py-3 rounded-lg font-semibold hover:bg-indigo-700 transition duration-150 shadow-md shadow-indigo-300">
-                    Kirim Pesan (Cek Perubahan & Simpan ke DB)
-                </button>
-                
-            </div>
-
-            <!-- 2. Display Status Profil Saat Ini -->
-            <div class="bg-white p-6 rounded-xl border border-indigo-100 shadow-lg">
-                <h2 class="text-xl font-semibold text-indigo-800 border-b pb-2 mb-4">Profil Aktif (Realtime DB)</h2>
-                
-                <div class="space-y-2 mb-4">
-                    <p class="text-gray-600"><strong>Nama Saat Ini:</strong> <span id="current-name-display" class="font-bold text-gray-800">N/A</span></p>
-                    <p class="text-gray-600"><strong>Username Saat Ini:</strong> <span id="current-username-display" class="font-bold text-gray-800">N/A</span></p>
-                </div>
-
-                <h3 class="text-lg font-medium text-indigo-700 mt-6 mb-3">Riwayat Perubahan (History)</h3>
-                
-                <div class="bg-gray-50 border rounded-lg h-64 overflow-y-auto">
-                    <ul id="history-list">
-                        <li class="p-4 text-center text-gray-500">Memuat data dari Firestore...</li>
-                    </ul>
-                </div>
-                
-            </div>
-        </main>
-        
-        <footer class="bg-gray-100 p-4 text-center text-xs text-gray-500">
-            Data dilacak secara persisten menggunakan Google Firestore.
-        </footer>
-    </div>
-
-</body>
-</html>
+if __name__ == '__main__':
+    main()
